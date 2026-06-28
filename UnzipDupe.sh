@@ -1,74 +1,22 @@
 #!/usr/bin/env bash
-#
-# ==============================================================================
-#  UnzipDupe.sh  --  parallel, safe, dedup-aware bulk archive extractor
-# ==============================================================================
-#
-#  Extracts every archive found in a target directory, then deletes each source
-#  archive once it has been successfully extracted. "Dedupe" means destination
-#  collision avoidance: an archive is skipped when its destination folder
-#  already exists, so re-running over a partially-processed directory is cheap
-#  and idempotent.
-#
-#  Design highlights
-#  -----------------
-#   * Per-archive private staging dir on the SAME filesystem as the target, so
-#     final placement is an atomic rename, partial failures never pollute the
-#     target, and cross-archive symlink attacks (cf. CVE-2025-45582) cannot
-#     chain through a shared extraction root.
-#   * Race-free dedup: the destination is claimed with an atomic `mkdir` BEFORE
-#     any files are written to disk, so two workers never fight over a
-#     destination and a duplicate is retired without a full extract-and-place.
-#     (Deciding the destination name still enumerates the archive index first;
-#     for zip/7z/rar that reads the cheap central directory, but for a
-#     compressed .tar.* it is a streaming decompression pass -- there is no
-#     random access into a compressed tar.)
-#   * Single-root collapse from the filesystem (authoritative), so an archive
-#     that already wraps its own top-level folder is never double-nested. The
-#     predicted name is validated and sanitized (leading ./ and / stripped,
-#     '.'/'..' rejected), so a crafted index cannot redirect the destination.
-#   * Runtime tool detection picks the fastest SAFE extractor available and the
-#     fastest parallel decompressor per format (lbzip2 for bzip2 is the big
-#     win; xz -T0 only helps multi-block streams; gzip/zstd decompression are
-#     effectively single-threaded -- see NOTES). The dominant speedup for a
-#     directory of many archives is outer parallelism (-j), not per-file
-#     threading; this script maximizes both.
-#   * Defense in depth: a symlink-escape scan rejects any extracted tree that
-#     contains a symlink resolving outside its staging dir.
-#   * Safety scope: GNU tar and bsdtar are safe-by-default against ../ and
-#     absolute paths; this script prefers them (incl. bsdtar for zip and 7z).
-#     The native unzip/7z/unrar fallbacks rely on the host tool being a modern,
-#     traversal-safe build, and the symlink scan cannot detect a *regular* file
-#     written outside the stage by a vulnerable extractor. Targets Linux (GNU
-#     coreutils); BSD/macOS shims are noted inline (stat, nproc).
-#
-#  Usage:  ./UnzipDupe.sh [options] [TARGET_DIR]
-#  Run    ./UnzipDupe.sh --help    for the full option list.
-#
-#  Requires bash >= 4.3 (for `wait -n`) plus `tar`; optional accelerators and
-#  format handlers are auto-detected: bsdtar(libarchive), 7z/7zz/7za, unzip,
-#  unrar, pigz, lbzip2/pbzip2, zstd, xz.
-# ==============================================================================
+# UnzipDupe.sh -- parallel, safe, dedup-aware bulk archive extractor.
+# Extracts every archive in a target directory (default: current dir), skips an
+# archive whose destination already exists, and deletes each source on success.
+# Run with --help for options.
 
 set -euo pipefail
 
-# ------------------------------------------------------------------------------
-# Defaults (override via CLI flags / positional TARGET_DIR / environment)
-# ------------------------------------------------------------------------------
-DEFAULT_TARGET_DIR="/home/ares/mnt/NTFS-Drive2/sm2/"
+DEFAULT_TARGET_DIR="."
 
 TARGET_DIR=""
 JOBS=""
-KEEP=0                 # --keep            : never delete source archives
-DRY_RUN=0              # --dry-run / -n    : show planned actions, change nothing
-PRUNE_DUPLICATES=0     # --prune-duplicates: delete a source whose dest exists
-QUIET=0                # --quiet / -q      : only warnings, errors and summary
-VERBOSE=0              # --verbose / -v    : extra per-archive detail
-COLOR_MODE="auto"      # --color=auto|always|never
+KEEP=0
+DRY_RUN=0
+PRUNE_DUPLICATES=0
+QUIET=0
+VERBOSE=0
+COLOR_MODE="auto"
 
-# ------------------------------------------------------------------------------
-# Colors (resolved after option parsing, tty-aware)
-# ------------------------------------------------------------------------------
 CLR_RESET="" CLR_INFO="" CLR_OK="" CLR_WARN="" CLR_ERR="" CLR_DIM=""
 setup_colors() {
     local on=0
@@ -83,11 +31,6 @@ setup_colors() {
     fi
 }
 
-# ------------------------------------------------------------------------------
-# Logging -- single printf per line is atomic for lines < PIPE_BUF (4 KiB),
-# which keeps parallel worker output from interleaving mid-line. All logs go to
-# stderr so stdout stays clean.
-# ------------------------------------------------------------------------------
 log_info() { (( QUIET )) || printf '%s[*]%s %s\n' "$CLR_INFO" "$CLR_RESET" "$*" >&2; }
 log_ok()   { (( QUIET )) || printf '%s[+]%s %s\n' "$CLR_OK"   "$CLR_RESET" "$*" >&2; }
 log_warn() {              printf '%s[!]%s %s\n' "$CLR_WARN" "$CLR_RESET" "$*" >&2; }
@@ -96,15 +39,12 @@ log_dbg()  { (( VERBOSE )) || return 0; printf '%s[.] %s%s\n' "$CLR_DIM" "$*" "$
 
 die() { log_err "$*"; exit 1; }
 
-# ------------------------------------------------------------------------------
-# Tool detection
-# ------------------------------------------------------------------------------
 have() { command -v "$1" >/dev/null 2>&1; }
 
 HAVE_BSDTAR=0 HAVE_7Z=0 HAVE_UNZIP=0 HAVE_UNRAR=0
-HAVE_PIGZ=0 HAVE_LBZIP2=0 HAVE_PBZIP2=0 HAVE_ZSTD=0 HAVE_XZ=0
+HAVE_PIGZ=0 HAVE_LBZIP2=0 HAVE_PBZIP2=0 HAVE_ZSTD=0 HAVE_XZ=0 HAVE_LZ4=0
 SEVENZIP=""
-GZ_PROG="" BZ_PROG="" ZSTD_PROG=""   # external decompressors for GNU tar (-I)
+GZ_PROG="" BZ_PROG="" ZSTD_PROG=""
 
 detect_tools() {
     have bsdtar && HAVE_BSDTAR=1
@@ -119,22 +59,16 @@ detect_tools() {
     have pbzip2 && HAVE_PBZIP2=1
     have zstd   && HAVE_ZSTD=1
     have xz     && HAVE_XZ=1
+    have lz4    && HAVE_LZ4=1
 
-    # Fastest available parallel decompressor per format. GNU tar invokes the
-    # named program with `-d` appended, so only a bare program name is passed.
-    (( HAVE_PIGZ ))                  && GZ_PROG="pigz"
+    (( HAVE_PIGZ )) && GZ_PROG="pigz"
     if   (( HAVE_LBZIP2 )); then BZ_PROG="lbzip2"
     elif (( HAVE_PBZIP2 )); then BZ_PROG="pbzip2"; fi
-    (( HAVE_ZSTD ))                  && ZSTD_PROG="zstd"
+    (( HAVE_ZSTD )) && ZSTD_PROG="zstd"
 
     have tar || (( HAVE_BSDTAR )) || die "neither 'tar' nor 'bsdtar' is available"
 }
 
-# ------------------------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------------------------
-# Strip a (possibly compound) archive extension, case-insensitively. Pure bash
-# (no GNU `sed ...$/I`), longest compound suffix first, original case preserved.
 strip_archive_ext() {
     local f=$1 low=${1,,} ext
     for ext in .tar.gz .tar.xz .tar.bz2 .tar.zst .tgz .txz .tbz2 .tzst .tar .zip .7z .rar; do
@@ -143,10 +77,14 @@ strip_archive_ext() {
     printf '%s' "$f"
 }
 
-# List archive contents (one path per line) without extracting. Output is
-# normalized: CRs stripped, backslashes -> slashes. Used only to predict the
-# destination name and to detect corruption; final placement is decided from
-# the extracted filesystem, so rare listing quirks cannot corrupt the result.
+strip_compressor_ext() {
+    local f=$1 low=${1,,} ext
+    for ext in .gz .bz2 .xz .zst .lz4 .lzma .z; do
+        if [[ $low == *"$ext" ]]; then printf '%s' "${f:0:${#f}-${#ext}}"; return; fi
+    done
+    printf '%s' "$f"
+}
+
 sevenzip_list() { "$SEVENZIP" l -slt "$1" 2>/dev/null | awk '/^Path = /{c++; if (c>1) print substr($0,8)}'; }
 
 list_archive() {
@@ -173,11 +111,6 @@ list_archive() {
     } 2>/dev/null | tr -d '\r' | tr '\134' '/'
 }
 
-# Extract $archive into directory $dest. Returns 0 on success, 1 on extraction
-# error, 2 when no capable tool is installed. stdout is discarded; stderr is
-# appended to $errlog for diagnostics. GNU tar and bsdtar are used unprivileged
-# of ownership (--no-same-owner) and are safe against ../ and absolute paths by
-# default; bsdtar additionally blocks symlink-target writes.
 tar_extract() {
     local dest=$1 archive=$2 prog=$3
     if [[ -n $prog ]]; then
@@ -200,13 +133,13 @@ extract_to() {
                 elif (( HAVE_UNZIP ));  then unzip -qq -o "$archive" -d "$dest"
                 elif (( HAVE_7Z ));     then "$SEVENZIP" x -y -bso0 -bsp0 -o"$dest" "$archive"
                 else return 2; fi ;;
-            *.tar.gz|*.tgz)            tar_extract "$dest" "$archive" "$GZ_PROG" ;;
-            *.tar.bz2|*.tbz2)         tar_extract "$dest" "$archive" "$BZ_PROG" ;;
-            *.tar.xz|*.txz)           tar_extract "$dest" "$archive" "" ;;
+            *.tar.gz|*.tgz)   tar_extract "$dest" "$archive" "$GZ_PROG" ;;
+            *.tar.bz2|*.tbz2) tar_extract "$dest" "$archive" "$BZ_PROG" ;;
+            *.tar.xz|*.txz)   tar_extract "$dest" "$archive" "" ;;
             *.tar.zst|*.tzst)
                 if [[ -n $ZSTD_PROG ]]; then tar_extract "$dest" "$archive" "$ZSTD_PROG"
                 else tar_extract "$dest" "$archive" ""; fi ;;
-            *.tar)                    tar_extract "$dest" "$archive" "" ;;
+            *.tar)            tar_extract "$dest" "$archive" "" ;;
             *.7z)
                 if   (( HAVE_BSDTAR )); then bsdtar --no-same-owner -x -f "$archive" -C "$dest"
                 elif (( HAVE_7Z ));     then "$SEVENZIP" x -y -bso0 -bsp0 -o"$dest" "$archive"
@@ -224,11 +157,31 @@ extract_to() {
     } >/dev/null 2>>"$errlog"
 }
 
-# Predict the destination *name* from a listing: the inner root folder for a
-# single-root archive, otherwise the archive's base name. Entries are first
-# normalized (leading "./" and "/" stripped) so tar archives stored with a "./"
-# prefix are read correctly, and a single top of "."/".." (crafted or absolute)
-# falls back to the archive base name so the index can never pick the target.
+decompress_stream() {
+    local low=${1,,}
+    case "$low" in
+        *.gz|*.z)
+            if (( HAVE_PIGZ )); then pigz -dc -- "$1"; elif have gzip; then gzip -dc -- "$1"; else return 2; fi ;;
+        *.bz2)
+            if   (( HAVE_LBZIP2 )); then lbzip2 -dc -- "$1"
+            elif (( HAVE_PBZIP2 )); then pbzip2 -dc -- "$1"
+            elif have bzip2;        then bzip2 -dc -- "$1"
+            else return 2; fi ;;
+        *.xz|*.lzma)
+            if (( HAVE_XZ )); then xz -dc -T0 -- "$1"; else return 2; fi ;;
+        *.zst)
+            if (( HAVE_ZSTD )); then zstd -dc -- "$1"; else return 2; fi ;;
+        *.lz4)
+            if (( HAVE_LZ4 )); then lz4 -dc -- "$1"; else return 2; fi ;;
+        *) return 2 ;;
+    esac
+}
+
+is_tar() {
+    if (( HAVE_BSDTAR )); then bsdtar -tf "$1" >/dev/null 2>&1
+    else tar -tf "$1" >/dev/null 2>&1; fi
+}
+
 predict_dest_name() {
     local listing=$1 base=$2 tops count
     listing=$(printf '%s\n' "$listing" | sed -E 's#^(\./)+##; s#^/+##' | grep . || true)
@@ -237,15 +190,14 @@ predict_dest_name() {
     count=$(printf '%s\n' "$tops" | grep -c .)
     if (( count == 1 )) && printf '%s\n' "$listing" | grep -q '/'; then
         case "$tops" in
-            ''|.|..) printf '%s' "$base" ;;   # unsafe top -> use archive base
-            *)       printf '%s' "$tops" ;;   # single-root: inner folder name
+            ''|.|..) printf '%s' "$base" ;;
+            *)       printf '%s' "$tops" ;;
         esac
     else
-        printf '%s' "$base"          # flat: name after the archive
+        printf '%s' "$base"
     fi
 }
 
-# Reject an extracted tree containing a symlink that resolves outside $stage.
 symlink_escapes() {
     local stage=$1 stage_real link target
     stage_real=$(realpath -- "$stage" 2>/dev/null) || return 0
@@ -253,29 +205,76 @@ symlink_escapes() {
         target=$(realpath -m -- "$link" 2>/dev/null) || return 0
         case "$target/" in
             "$stage_real/"*) : ;;
-            *) return 0 ;;           # escapes -> "unsafe" (function succeeds)
+            *) return 0 ;;
         esac
     done < <(find "$stage" -type l -print0 2>/dev/null)
-    return 1                          # no escape found -> safe
+    return 1
 }
 
-# Portable byte size: GNU `stat -c`, then BSD/macOS `stat -f`, else 0.
 file_size() { stat -c '%s' "$1" 2>/dev/null || stat -f '%z' "$1" 2>/dev/null || echo 0; }
 
-# ------------------------------------------------------------------------------
-# Per-archive worker. Records exactly one result line so the parent can tally
-# after `wait`. Never propagates failure to the parent (set -e safe): every
-# fallible step is guarded.
-# ------------------------------------------------------------------------------
-process_archive() {
-    local archive=$1 idx=$2
-    local result="$RESULTS_DIR/$idx"
-    local errlog="$RESULTS_DIR/$idx.err"
-    local filename base
-    filename=$(basename -- "$archive")
-    base=$(strip_archive_ext "$filename")
+new_stage() { mktemp -d "$TARGET_DIR/.unzipdupe.stage.$RUNID.XXXXXX" 2>/dev/null; }
 
-    # 1. Cheap content listing -> corruption check + destination prediction.
+record_dup() {
+    local result=$1 archive=$2 filename=$3
+    if (( PRUNE_DUPLICATES )); then
+        local sz; sz=$(file_size "$archive"); rm -f -- "$archive"
+        log_warn "duplicate pruned (dest exists): $filename"
+        printf 'dup_pruned\t%s\n' "$sz" >"$result"
+    else
+        log_warn "skip (dest exists): $filename"
+        printf 'dup\t0\n' >"$result"
+    fi
+}
+
+record_ok() {
+    local result=$1 archive=$2 filename=$3 label=$4
+    local sz; sz=$(file_size "$archive")
+    if (( KEEP )); then
+        log_ok "extracted (kept): $filename -> $label"
+        printf 'ok_kept\t0\n' >"$result"
+    else
+        rm -f -- "$archive"
+        log_ok "extracted: $filename -> $label"
+        printf 'ok\t%s\n' "$sz" >"$result"
+    fi
+}
+
+# Move the contents of a populated $stage into an already-claimed (empty) $dest,
+# collapsing a sole top-level directory. On any failure $dest and $stage are
+# removed. Returns: 0 ok, 1 unsafe (symlink escape), 2 empty, 3 placement error.
+finalize_stage_into_dest() {
+    local stage=$1 dest=$2
+    find "$stage" -depth \( -name '__MACOSX' -o -name '.DS_Store' -o -name '.AppleDouble' \) \
+        -exec rm -rf -- {} + 2>/dev/null || true
+    if symlink_escapes "$stage"; then rm -rf -- "$dest" "$stage"; return 1; fi
+    local -a top items
+    shopt -s nullglob dotglob
+    top=( "$stage"/* )
+    local src=$stage
+    if (( ${#top[@]} == 1 )) && [[ -d ${top[0]} && ! -L ${top[0]} ]]; then src=${top[0]}; fi
+    items=( "$src"/* )
+    shopt -u nullglob dotglob
+    if (( ${#items[@]} == 0 )); then rm -rf -- "$dest" "$stage"; return 2; fi
+    if ! mv -- "${items[@]}" "$dest"/ 2>/dev/null; then rm -rf -- "$dest" "$stage"; return 3; fi
+    rm -rf -- "$stage"
+    return 0
+}
+
+report_finalize() {
+    local fr=$1 result=$2 archive=$3 filename=$4 label=$5
+    case "$fr" in
+        0) record_ok "$result" "$archive" "$filename" "$label" ;;
+        1) log_err "unsafe (symlink escapes archive root, kept): $filename"; printf 'unsafe\t0\n' >"$result" ;;
+        2) log_warn "skip (nothing to extract): $filename"; printf 'corrupt\t0\n' >"$result" ;;
+        *) log_err "placement failed (rolled back, archive kept): $filename"; printf 'failed\t0\n' >"$result" ;;
+    esac
+}
+
+handle_archive() {
+    local archive=$1 result=$2 errlog=$3 filename=$4
+    local base; base=$(strip_archive_ext "$filename")
+
     local listing
     listing=$(list_archive "$archive" \
         | grep -Ev '^(__MACOSX|\.DS_Store)(/|$)|/\.DS_Store$|/__MACOSX(/|$)' \
@@ -287,7 +286,6 @@ process_archive() {
 
     local dest_name dest
     dest_name=$(predict_dest_name "$listing" "$base")
-    # Never let the destination escape TARGET_DIR or alias it / its parent.
     case "$dest_name" in
         ''|.|..|*/*)
             log_warn "skip (invalid destination name): $filename"
@@ -295,7 +293,6 @@ process_archive() {
     esac
     dest="$TARGET_DIR/$dest_name"
 
-    # 2. Dry-run: report the plan and stop.
     if (( DRY_RUN )); then
         if [[ -e $dest ]]; then
             log_info "would skip (dest exists): $filename -> $dest_name"
@@ -307,107 +304,124 @@ process_archive() {
         return 0
     fi
 
-    # 3. Atomic dedup claim: reserve the destination before doing any work.
-    if ! mkdir "$dest" 2>/dev/null; then
-        if (( PRUNE_DUPLICATES )); then
-            local sz; sz=$(file_size "$archive")
-            rm -f -- "$archive"
-            log_warn "duplicate pruned (dest exists): $filename"
-            printf 'dup_pruned\t%s\n' "$sz" >"$result"
-        else
-            log_warn "skip (dest exists): $filename"
-            printf 'dup\t0\n' >"$result"
-        fi
-        return 0
-    fi
+    if ! mkdir "$dest" 2>/dev/null; then record_dup "$result" "$archive" "$filename"; return 0; fi
 
-    # 4. Extract into a private, run-scoped staging dir on the target fs.
     local stage
-    if ! stage=$(mktemp -d "$TARGET_DIR/.unzipdupe.stage.$RUNID.XXXXXX" 2>/dev/null); then
+    if ! stage=$(new_stage); then
         rmdir -- "$dest" 2>/dev/null || true
         log_err "cannot create staging dir for: $filename"
         printf 'failed\t0\n' >"$result"; return 0
     fi
 
-    # Capture the real exit status: `if ! cmd` would mask it to 0, so the
-    # rc==2 ("no capable tool") diagnostic must read it via `|| rc=$?`.
     local rc=0
     extract_to "$stage" "$archive" "$errlog" || rc=$?
     if (( rc != 0 )); then
         rmdir -- "$dest" 2>/dev/null || true
         rm -rf -- "$stage"
-        if (( rc == 2 )); then
-            log_err "no tool to extract: $filename"
+        if (( rc == 2 )); then log_err "no tool to extract: $filename"
+        else log_err "extraction failed (archive kept): $filename"; fi
+        printf 'failed\t0\n' >"$result"; return 0
+    fi
+
+    local fr=0; finalize_stage_into_dest "$stage" "$dest" || fr=$?
+    report_finalize "$fr" "$result" "$archive" "$filename" "$dest_name/"
+    return 0
+}
+
+handle_compressed() {
+    local archive=$1 result=$2 errlog=$3 filename=$4
+    local inner; inner=$(strip_compressor_ext "$filename")
+    case "$inner" in
+        ''|.|..|*/*)
+            log_warn "skip (invalid name): $filename"
+            printf 'corrupt\t0\n' >"$result"; return 0 ;;
+    esac
+
+    if (( DRY_RUN )); then
+        if [[ -e "$TARGET_DIR/$inner" ]]; then
+            log_info "would skip (exists): $filename -> $inner"
+            printf 'dup\t0\n' >"$result"
         else
-            log_err "extraction failed (archive kept): $filename"
-            if (( VERBOSE )) && [[ -s $errlog ]]; then log_dbg "$(tail -n1 -- "$errlog")"; fi
+            log_info "would decompress: $filename -> $inner (extract if it is a tar)"
+            printf 'dryrun\t0\n' >"$result"
         fi
+        return 0
+    fi
+
+    local stage
+    if ! stage=$(new_stage); then
+        log_err "cannot create staging dir for: $filename"
         printf 'failed\t0\n' >"$result"; return 0
     fi
 
-    # 5. Drop macOS cruft so it cannot affect single-root detection or output.
-    find "$stage" -depth \( -name '__MACOSX' -o -name '.DS_Store' -o -name '.AppleDouble' \) \
-        -exec rm -rf -- {} + 2>/dev/null || true
-
-    # 6. Security: reject trees with symlinks escaping the staging dir.
-    if symlink_escapes "$stage"; then
-        rmdir -- "$dest" 2>/dev/null || true
+    local out="$stage/$inner" rc=0
+    decompress_stream "$archive" >"$out" 2>>"$errlog" || rc=$?
+    if (( rc != 0 )); then
         rm -rf -- "$stage"
-        log_err "unsafe (symlink escapes archive root, kept): $filename"
-        printf 'unsafe\t0\n' >"$result"; return 0
-    fi
-
-    # 7. Collapse a sole top-level directory (authoritative, from filesystem).
-    local -a top
-    shopt -s nullglob dotglob
-    top=( "$stage"/* )
-    local src=$stage
-    # Collapse only into a *real* sole directory; a sole symlink must not be
-    # descended (globbing through it would move its targets, not the entry).
-    if (( ${#top[@]} == 1 )) && [[ -d ${top[0]} && ! -L ${top[0]} ]]; then src=${top[0]}; fi
-    local -a items=( "$src"/* )
-    shopt -u nullglob dotglob
-
-    if (( ${#items[@]} == 0 )); then
-        rmdir -- "$dest" 2>/dev/null || true
-        rm -rf -- "$stage"
-        log_warn "skip (nothing to extract): $filename"
-        printf 'corrupt\t0\n' >"$result"; return 0
-    fi
-
-    # 8. Place the content into the claimed destination (renames, same fs).
-    if ! mv -- "${items[@]}" "$dest"/ 2>>"$errlog"; then
-        # We created $dest this run, so removing it rolls back cleanly and lets
-        # a future run retry instead of seeing a half-populated "duplicate".
-        rm -rf -- "$dest" "$stage"
-        log_err "placement failed (rolled back, archive kept): $filename"
+        if (( rc == 2 )); then log_err "no tool to decompress: $filename"
+        else log_err "decompression failed (kept): $filename"; fi
         printf 'failed\t0\n' >"$result"; return 0
     fi
-    rm -rf -- "$stage"
 
-    # 9. Success -> retire the source archive (unless --keep).
-    local sz; sz=$(file_size "$archive")
-    if (( KEEP )); then
-        log_ok "extracted (kept): $filename -> $dest_name/"
-        printf 'ok_kept\t0\n' >"$result"
+    if is_tar "$out"; then
+        local tname=$inner
+        case "${inner,,}" in *.tar) tname=${inner:0:${#inner}-4} ;; esac
+        case "$tname" in ''|.|..|*/*) tname=$inner ;; esac
+        local dest="$TARGET_DIR/$tname"
+        if ! mkdir "$dest" 2>/dev/null; then
+            record_dup "$result" "$archive" "$filename"; rm -rf -- "$stage"; return 0
+        fi
+        local sub
+        if ! sub=$(new_stage); then
+            rmdir -- "$dest" 2>/dev/null || true; rm -rf -- "$stage"
+            log_err "cannot create staging dir for: $filename"
+            printf 'failed\t0\n' >"$result"; return 0
+        fi
+        local er=0
+        { if (( HAVE_BSDTAR )); then bsdtar --no-same-owner -x -f "$out" -C "$sub"
+          else tar --no-same-owner -x -f "$out" -C "$sub"; fi; } >/dev/null 2>>"$errlog" || er=$?
+        rm -rf -- "$stage"
+        if (( er != 0 )); then
+            rmdir -- "$dest" 2>/dev/null || true; rm -rf -- "$sub"
+            log_err "extraction failed (archive kept): $filename"
+            printf 'failed\t0\n' >"$result"; return 0
+        fi
+        local fr=0; finalize_stage_into_dest "$sub" "$dest" || fr=$?
+        report_finalize "$fr" "$result" "$archive" "$filename" "$tname/"
+        return 0
+    fi
+
+    local dest="$TARGET_DIR/$inner"
+    if [[ -e $dest ]]; then record_dup "$result" "$archive" "$filename"; rm -rf -- "$stage"; return 0; fi
+    if ln -- "$out" "$dest" 2>/dev/null; then
+        rm -rf -- "$stage"; record_ok "$result" "$archive" "$filename" "$inner"
+    elif [[ ! -e $dest ]] && mv -- "$out" "$dest" 2>/dev/null; then
+        rm -rf -- "$stage"; record_ok "$result" "$archive" "$filename" "$inner"
     else
-        rm -f -- "$archive"
-        log_ok "extracted: $filename -> $dest_name/"
-        printf 'ok\t%s\n' "$sz" >"$result"
+        rm -rf -- "$stage"; record_dup "$result" "$archive" "$filename"
     fi
     return 0
 }
 
-# ------------------------------------------------------------------------------
-# Cleanup
-# ------------------------------------------------------------------------------
+process_archive() {
+    local archive=$1 idx=$2
+    local result="$RESULTS_DIR/$idx" errlog="$RESULTS_DIR/$idx.err"
+    local filename; filename=$(basename -- "$archive")
+    case "${filename,,}" in
+        *.zip|*.7z|*.rar|*.tar|*.tar.gz|*.tgz|*.tar.xz|*.txz|*.tar.bz2|*.tbz2|*.tar.zst|*.tzst)
+            handle_archive "$archive" "$result" "$errlog" "$filename" ;;
+        *.gz|*.bz2|*.xz|*.zst|*.lz4|*.lzma|*.z)
+            handle_compressed "$archive" "$result" "$errlog" "$filename" ;;
+        *)
+            handle_archive "$archive" "$result" "$errlog" "$filename" ;;
+    esac
+}
+
 RESULTS_DIR=""
 RUNID=""
 cleanup() {
     local code=$?
     if [[ -n $RESULTS_DIR && -d $RESULTS_DIR ]]; then rm -rf -- "$RESULTS_DIR"; fi
-    # Remove only THIS run's staging dirs (scoped by RUNID) so a concurrent
-    # run against the same target is never disturbed.
     if [[ -n ${RUNID:-} && -n ${TARGET_DIR:-} && -d ${TARGET_DIR:-} ]]; then
         local d
         shopt -s nullglob
@@ -419,7 +433,6 @@ cleanup() {
 on_interrupt() {
     log_err "interrupt -- terminating workers and rolling back staging dirs..."
     trap - INT TERM
-    # Kill only our own background workers (no process-group blast radius).
     local -a pids
     mapfile -t pids < <(jobs -p)
     if (( ${#pids[@]} )); then kill "${pids[@]}" 2>/dev/null || true; fi
@@ -427,77 +440,64 @@ on_interrupt() {
     exit 130
 }
 
-# ------------------------------------------------------------------------------
-# Human-readable byte formatter
-# ------------------------------------------------------------------------------
 human_bytes() {
     local b=${1:-0} u=(B KiB MiB GiB TiB) i=0
     while (( b >= 1024 && i < 4 )); do b=$(( b / 1024 )); i=$((i+1)); done
     printf '%s %s' "$b" "${u[$i]}"
 }
 
-# ------------------------------------------------------------------------------
-# Usage
-# ------------------------------------------------------------------------------
 usage() {
     cat <<EOF
 UnzipDupe.sh -- parallel, safe, dedup-aware bulk archive extractor
 
 Usage: $(basename -- "$0") [options] [TARGET_DIR]
 
-Extracts every archive in TARGET_DIR (non-recursive). An archive that wraps a
-single top-level folder is placed as TARGET_DIR/<folder>/; otherwise its files
-go into TARGET_DIR/<archive-base-name>/. An archive whose destination already
-exists is skipped (dedup). Source archives are deleted after a successful
-extraction unless --keep is given.
+Extracts every archive in TARGET_DIR (non-recursive; default: current dir).
+A multi-file archive lands in TARGET_DIR/<name>/; a bare single-file compressor
+(e.g. foo.pdf.gz) decompresses to TARGET_DIR/foo.pdf. Destinations that already
+exist are skipped (dedup). Sources are deleted on success unless --keep.
 
 Options:
-  -j, --jobs N          Parallel workers (default: nproc).
-  -k, --keep            Keep source archives after extraction.
-  -n, --dry-run         Show what would happen; change nothing.
-      --prune-duplicates  Delete a source archive whose destination exists.
-  -q, --quiet           Only warnings, errors and the final summary.
-  -v, --verbose         Extra per-archive diagnostics.
-      --color=WHEN      auto (default), always, or never.
-  -h, --help            This help.
+  -j, --jobs N            Parallel workers (default: nproc).
+  -k, --keep              Keep source archives after extraction.
+  -n, --dry-run           Show what would happen; change nothing.
+      --prune-duplicates  Delete a source whose destination already exists.
+  -q, --quiet             Only warnings, errors and the final summary.
+  -v, --verbose           Extra per-archive diagnostics.
+      --color=WHEN        auto (default), always, or never.
+  -h, --help              This help.
 
-TARGET_DIR defaults to: $DEFAULT_TARGET_DIR
-Supported: .zip .7z .rar .tar .tar.gz/.tgz .tar.bz2/.tbz2 .tar.xz/.txz
-           .tar.zst/.tzst   (handlers auto-detected at runtime)
+Archives:  .zip .7z .rar .tar .tar.gz/.tgz .tar.bz2/.tbz2 .tar.xz/.txz .tar.zst/.tzst
+Single file: .gz .bz2 .xz .zst .lz4 .lzma .Z  (auto-extracted if they contain a tar)
+Handlers are auto-detected; parallel decompressors (pigz/lbzip2/zstd/xz -T0) used when present.
 EOF
 }
 
-# ------------------------------------------------------------------------------
-# Argument parsing
-# ------------------------------------------------------------------------------
 parse_args() {
     while (( $# )); do
         case "$1" in
-            -j|--jobs)        JOBS=${2:-}; shift 2 ;;
-            --jobs=*)         JOBS=${1#*=}; shift ;;
-            -j*)              JOBS=${1#-j}; shift ;;
-            -k|--keep)        KEEP=1; shift ;;
-            -n|--dry-run)     DRY_RUN=1; shift ;;
+            -j|--jobs)          JOBS=${2:-}; shift 2 ;;
+            --jobs=*)           JOBS=${1#*=}; shift ;;
+            -j*)                JOBS=${1#-j}; shift ;;
+            -k|--keep)          KEEP=1; shift ;;
+            -n|--dry-run)       DRY_RUN=1; shift ;;
             --prune-duplicates) PRUNE_DUPLICATES=1; shift ;;
-            -q|--quiet)       QUIET=1; shift ;;
-            -v|--verbose)     VERBOSE=1; shift ;;
-            --color)          COLOR_MODE=${2:-auto}; shift 2 ;;
-            --color=*)        COLOR_MODE=${1#*=}; shift ;;
-            -h|--help)        usage; exit 0 ;;
-            --)               shift; [[ $# -gt 0 ]] && TARGET_DIR=$1; break ;;
-            -*)               usage >&2; die "unknown option: $1" ;;
-            *)                TARGET_DIR=$1; shift ;;
+            -q|--quiet)         QUIET=1; shift ;;
+            -v|--verbose)       VERBOSE=1; shift ;;
+            --color)            COLOR_MODE=${2:-auto}; shift 2 ;;
+            --color=*)          COLOR_MODE=${1#*=}; shift ;;
+            -h|--help)          usage; exit 0 ;;
+            --)                 shift; [[ $# -gt 0 ]] && TARGET_DIR=$1; break ;;
+            -*)                 usage >&2; die "unknown option: $1" ;;
+            *)                  TARGET_DIR=$1; shift ;;
         esac
     done
     [[ -n $TARGET_DIR ]] || TARGET_DIR=$DEFAULT_TARGET_DIR
-    TARGET_DIR=${TARGET_DIR%/}
+    [[ $TARGET_DIR == / ]] || TARGET_DIR=${TARGET_DIR%/}
     [[ -z $JOBS ]] && JOBS=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
     [[ $JOBS =~ ^[1-9][0-9]*$ ]] || die "--jobs must be a positive integer (got: $JOBS)"
 }
 
-# ------------------------------------------------------------------------------
-# Main
-# ------------------------------------------------------------------------------
 main() {
     parse_args "$@"
     setup_colors
@@ -505,15 +505,14 @@ main() {
 
     [[ -d $TARGET_DIR ]] || die "target directory does not exist: $TARGET_DIR"
 
-    # Gather archives (NUL-safe, non-recursive, skip our own staging dirs).
     local -a archives=()
     local f
     while IFS= read -r -d '' f; do archives+=("$f"); done < <(
         find "$TARGET_DIR" -maxdepth 1 -type f \( \
-            -iname '*.zip'     -o -iname '*.7z'      -o -iname '*.rar'    -o \
-            -iname '*.tar'     -o -iname '*.tar.gz'  -o -iname '*.tgz'    -o \
-            -iname '*.tar.xz'  -o -iname '*.txz'     -o -iname '*.tar.bz2' -o \
-            -iname '*.tbz2'    -o -iname '*.tar.zst' -o -iname '*.tzst'   \
+            -iname '*.zip'  -o -iname '*.7z'   -o -iname '*.rar'  -o -iname '*.tar'  -o \
+            -iname '*.tgz'  -o -iname '*.txz'  -o -iname '*.tbz2' -o -iname '*.tzst' -o \
+            -iname '*.gz'   -o -iname '*.bz2'  -o -iname '*.xz'   -o -iname '*.zst'  -o \
+            -iname '*.lz4'  -o -iname '*.lzma' -o -iname '*.Z'    \
         \) -print0 2>/dev/null)
 
     if (( ${#archives[@]} == 0 )); then
@@ -527,15 +526,12 @@ main() {
     trap on_interrupt INT TERM
 
     log_info "target: $TARGET_DIR"
-    log_info "workers: $JOBS | archives: ${#archives[@]}${DRY_RUN:+ | DRY-RUN}"
+    log_info "workers: $JOBS | archives: ${#archives[@]}$( ((DRY_RUN)) && printf ' | DRY-RUN')"
     log_dbg "extractors: bsdtar=$HAVE_BSDTAR 7z=${SEVENZIP:-none} unzip=$HAVE_UNZIP unrar=$HAVE_UNRAR"
-    log_dbg "decompressors: gz=${GZ_PROG:-builtin} bz2=${BZ_PROG:-builtin} xz=$([[ $HAVE_XZ == 1 ]] && echo 'xz -T0' || echo builtin) zst=${ZSTD_PROG:-builtin}"
+    log_dbg "decompressors: gz=${GZ_PROG:-builtin} bz2=${BZ_PROG:-builtin} xz=$([[ $HAVE_XZ == 1 ]] && echo 'xz -T0' || echo builtin) zst=${ZSTD_PROG:-builtin} lz4=$HAVE_LZ4"
 
     local start=$SECONDS
 
-    # Bounded worker pool: at most $JOBS workers run at once. We block on a
-    # blocking `wait -n` (no busy-wait, no per-iteration subshell) BEFORE each
-    # spawn, so the cap is honored strictly rather than transiently exceeded.
     local i running=0
     for (( i=0; i<${#archives[@]}; i++ )); do
         if (( running >= JOBS )); then wait -n 2>/dev/null || true; running=$((running - 1)); fi
@@ -544,7 +540,6 @@ main() {
     done
     wait
 
-    # Tally results.
     local ok=0 ok_kept=0 dup=0 dup_pruned=0 corrupt=0 failed=0 unsafe=0 dry=0
     local reclaimed=0 status sz
     for (( i=0; i<${#archives[@]}; i++ )); do
@@ -565,7 +560,7 @@ main() {
     local elapsed=$(( SECONDS - start ))
     log_info "------------------------------------------------------------"
     if (( DRY_RUN )); then
-        log_info "DRY-RUN summary: would extract $dry, would skip $dup (elapsed ${elapsed}s)"
+        log_info "DRY-RUN summary: would process $dry, would skip $dup (elapsed ${elapsed}s)"
     else
         log_info "Done in ${elapsed}s: extracted $ok$( ((ok_kept)) && printf ' (+%s kept)' "$ok_kept"), \
 skipped $dup dup$( ((dup_pruned)) && printf ', pruned %s' "$dup_pruned"), \
@@ -575,8 +570,6 @@ corrupt $corrupt, unsafe $unsafe, failed $failed"
     (( failed + unsafe == 0 ))
 }
 
-# Only auto-run when executed directly, not when sourced (keeps `kill`/traps
-# from affecting a parent shell that sources this file).
 if [[ ${BASH_SOURCE[0]} == "${0}" ]]; then
     main "$@"
 fi
